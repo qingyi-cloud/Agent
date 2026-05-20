@@ -32,12 +32,16 @@ def cargo_item(
     end_lat: float = 23.0,
     end_lng: float = 113.8,
     truck_lengths: list[str] | None = None,
+    create_time: str = "2026-03-01 00:00:00",
+    remove_time: str = "2026-03-31 23:59:00",
 ) -> dict[str, Any]:
     return {
         "distance_km": distance_km,
         "cargo": {
             "cargo_id": cargo_id,
             "cargo_name": cargo_name,
+            "create_time": create_time,
+            "remove_time": remove_time,
             "price": price,
             "cost_time_minutes": haul_minutes,
             "load_time": ["2026-03-01 00:00:00", "2026-03-31 23:59:00"],
@@ -55,6 +59,8 @@ class FakeApi:
         status: dict[str, Any] | None = None,
         items: list[dict[str, Any]] | None = None,
         history: list[dict[str, Any]] | None = None,
+        model_response: dict[str, Any] | None = None,
+        query_scan_minutes: int = 0,
     ) -> None:
         self.status = {
             "driver_id": "D001",
@@ -70,6 +76,9 @@ class FakeApi:
             self.status.update(status)
         self.items = items or []
         self.history = history or []
+        self.model_response = model_response
+        self.query_scan_minutes = query_scan_minutes
+        self.model_payloads: list[dict[str, Any]] = []
         self.model_calls = 0
         self.query_points: list[tuple[float, float]] = []
 
@@ -78,6 +87,7 @@ class FakeApi:
 
     def query_cargo(self, driver_id: str, latitude: float, longitude: float) -> dict[str, Any]:
         self.query_points.append((latitude, longitude))
+        self.status["simulation_progress_minutes"] = int(self.status.get("simulation_progress_minutes", 0)) + self.query_scan_minutes
         return {"driver_id": driver_id, "items": list(self.items)}
 
     def query_decision_history(self, driver_id: str, step: int) -> dict[str, Any]:
@@ -90,7 +100,10 @@ class FakeApi:
 
     def model_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.model_calls += 1
-        raise AssertionError("deterministic agent should not call the model for standard decisions")
+        self.model_payloads.append(payload)
+        if self.model_response is None:
+            raise AssertionError("deterministic agent should not call the model for standard decisions")
+        return self.model_response
 
 
 class RuleBasedDecisionServiceTest(unittest.TestCase):
@@ -102,7 +115,7 @@ class RuleBasedDecisionServiceTest(unittest.TestCase):
             ]
         )
 
-        action = ModelDecisionService(api).decide("D001")
+        action = ModelDecisionService(api, use_model=False).decide("D001")
 
         self.assertEqual(action, {"action": "take_order", "params": {"cargo_id": "far_high"}})
         self.assertEqual(api.model_calls, 0)
@@ -124,7 +137,7 @@ class RuleBasedDecisionServiceTest(unittest.TestCase):
             ],
         )
 
-        action = ModelDecisionService(api).decide("D002")
+        action = ModelDecisionService(api, use_model=False).decide("D002")
 
         self.assertEqual(action, {"action": "take_order", "params": {"cargo_id": "safe"}})
         self.assertEqual(api.model_calls, 0)
@@ -145,7 +158,7 @@ class RuleBasedDecisionServiceTest(unittest.TestCase):
             items=[cargo_item("tempting", price=2000.0, distance_km=2.0)],
         )
 
-        action = ModelDecisionService(api).decide("D005")
+        action = ModelDecisionService(api, use_model=False).decide("D005")
 
         self.assertEqual(action, {"action": "wait", "params": {"duration_minutes": 390}})
         self.assertEqual(api.query_points, [])
@@ -154,7 +167,7 @@ class RuleBasedDecisionServiceTest(unittest.TestCase):
     def test_uses_wait_when_no_viable_cargo_exists(self) -> None:
         api = FakeApi(items=[])
 
-        action = ModelDecisionService(api).decide("D001")
+        action = ModelDecisionService(api, use_model=False).decide("D001")
 
         self.assertEqual(action["action"], "wait")
         self.assertGreaterEqual(action["params"]["duration_minutes"], 15)
@@ -176,7 +189,7 @@ class RuleBasedDecisionServiceTest(unittest.TestCase):
             items=[cargo_item("crosses_night", price=2000.0, distance_km=0.0, haul_minutes=180)],
         )
 
-        action = ModelDecisionService(api).decide("D005")
+        action = ModelDecisionService(api, use_model=False).decide("D005")
 
         self.assertEqual(action["action"], "wait")
         self.assertEqual(api.model_calls, 0)
@@ -216,10 +229,75 @@ class RuleBasedDecisionServiceTest(unittest.TestCase):
             ],
         )
 
-        action = ModelDecisionService(api).decide("D001")
+        action = ModelDecisionService(api, use_model=False).decide("D001")
 
         self.assertEqual(action, {"action": "take_order", "params": {"cargo_id": "inside"}})
         self.assertEqual(api.model_calls, 0)
+
+    def test_model_can_rerank_viable_candidates(self) -> None:
+        api = FakeApi(
+            items=[
+                cargo_item("near_low", price=180.0, distance_km=5.0, haul_minutes=120),
+                cargo_item("far_high", price=900.0, distance_km=40.0, haul_minutes=180),
+            ],
+            model_response={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"action":"take_order","cargo_id":"near_low","reason":"shorter and safer"}'
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            },
+        )
+
+        action = ModelDecisionService(api, use_model=True).decide("D001")
+
+        self.assertEqual(action, {"action": "take_order", "params": {"cargo_id": "near_low"}})
+        self.assertEqual(api.model_calls, 1)
+        self.assertIn("messages", api.model_payloads[0])
+        self.assertIs(api.model_payloads[0].get("enable_thinking"), False)
+
+    def test_invalid_model_choice_falls_back_to_rule_best(self) -> None:
+        api = FakeApi(
+            items=[
+                cargo_item("near_low", price=180.0, distance_km=5.0, haul_minutes=120),
+                cargo_item("far_high", price=900.0, distance_km=40.0, haul_minutes=180),
+            ],
+            model_response={
+                "choices": [{"message": {"content": '{"action":"take_order","cargo_id":"not_visible"}'}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            },
+        )
+
+        action = ModelDecisionService(api, use_model=True).decide("D001")
+
+        self.assertEqual(action, {"action": "take_order", "params": {"cargo_id": "far_high"}})
+        self.assertEqual(api.model_calls, 1)
+
+    def test_filters_cargo_expired_after_query_scan_cost(self) -> None:
+        api = FakeApi(
+            status={
+                "simulation_progress_minutes": 8 * 60,
+                "simulation_wall_time": "2026-03-01 08:00:00",
+            },
+            query_scan_minutes=10,
+            items=[
+                cargo_item(
+                    "expired_after_scan",
+                    price=2000.0,
+                    distance_km=2.0,
+                    haul_minutes=120,
+                    remove_time="2026-03-01 08:05:00",
+                ),
+                cargo_item("still_online", price=300.0, distance_km=6.0, haul_minutes=120),
+            ],
+        )
+
+        action = ModelDecisionService(api, use_model=False).decide("D001")
+
+        self.assertEqual(action, {"action": "take_order", "params": {"cargo_id": "still_online"}})
 
 
 if __name__ == "__main__":

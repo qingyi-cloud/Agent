@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import math
 import re
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ _DEFAULT_COST_PER_KM = 1.5
 _DEFAULT_WAIT_MINUTES = 30
 _MIN_WAIT_MINUTES = 15
 _MONTH_HORIZON_MINUTES = 30 * 24 * 60
+_MODEL_CANDIDATE_LIMIT = 6
 
 
 def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -239,13 +241,26 @@ class CargoOption:
     score: float
     net_income: float
     finish_minutes: int
+    total_minutes: int
+    pickup_km: float
+    haul_km: float
+    wait_minutes: int
+    price: float
 
 
 class ModelDecisionService:
     """单步决策入口：规则过滤 + 收益/时间打分。"""
 
-    def __init__(self, api: SimulationApiPort) -> None:
+    def __init__(
+        self,
+        api: SimulationApiPort,
+        *,
+        use_model: bool = True,
+        model_candidate_limit: int = _MODEL_CANDIDATE_LIMIT,
+    ) -> None:
         self._api = api
+        self._use_model = use_model
+        self._model_candidate_limit = max(1, int(model_candidate_limit))
         self._logger = logging.getLogger("agent.decision_service")
 
     def decide(self, driver_id: str) -> dict[str, Any]:
@@ -283,6 +298,14 @@ class ModelDecisionService:
 
         if options:
             best = max(options, key=lambda option: option.score)
+            model_action = self._model_rerank_action(
+                driver_id=driver_id,
+                status=action_status,
+                options=options,
+                fallback=best,
+            )
+            if model_action is not None:
+                return model_action
             self._logger.info(
                 "rule decision take_order driver_id=%s cargo_id=%s score=%.2f net=%.2f finish_min=%s",
                 driver_id,
@@ -294,6 +317,129 @@ class ModelDecisionService:
             return {"action": "take_order", "params": {"cargo_id": best.cargo_id}}
 
         return self._wait_action(self._fallback_wait_minutes(profile, action_now))
+
+    def _model_rerank_action(
+        self,
+        *,
+        driver_id: str,
+        status: dict[str, Any],
+        options: list[CargoOption],
+        fallback: CargoOption,
+    ) -> dict[str, Any] | None:
+        if not self._use_model:
+            return None
+
+        candidates = sorted(options, key=lambda option: option.score, reverse=True)[: self._model_candidate_limit]
+        candidate_ids = {option.cargo_id for option in candidates}
+        payload = self._build_model_payload(driver_id, status, candidates)
+        try:
+            response = self._api.model_chat_completion(payload)
+        except Exception:
+            self._logger.warning("model rerank failed; fallback to rule decision", exc_info=True)
+            return None
+
+        decision = self._extract_model_decision(response)
+        action_name = str(decision.get("action", "")).strip()
+        cargo_id = str(decision.get("cargo_id", "") or decision.get("id", "")).strip()
+        if action_name == "take_order" and cargo_id in candidate_ids:
+            self._logger.info(
+                "model decision take_order driver_id=%s cargo_id=%s fallback_cargo_id=%s",
+                driver_id,
+                cargo_id,
+                fallback.cargo_id,
+            )
+            return {"action": "take_order", "params": {"cargo_id": cargo_id}}
+
+        self._logger.info(
+            "model decision invalid action=%s cargo_id=%s; fallback_cargo_id=%s",
+            action_name,
+            cargo_id,
+            fallback.cargo_id,
+        )
+        return None
+
+    def _build_model_payload(
+        self,
+        driver_id: str,
+        status: dict[str, Any],
+        candidates: list[CargoOption],
+    ) -> dict[str, Any]:
+        candidate_payload = [
+            {
+                "cargo_id": option.cargo_id,
+                "cargo_name": option.cargo_name,
+                "rule_score": round(option.score, 2),
+                "estimated_net_income": round(option.net_income, 2),
+                "price": round(option.price, 2),
+                "total_minutes": option.total_minutes,
+                "pickup_km": round(option.pickup_km, 2),
+                "haul_km": round(option.haul_km, 2),
+                "wait_minutes": option.wait_minutes,
+                "finish_minute": option.finish_minutes,
+            }
+            for option in candidates
+        ]
+        preferences = [_preference_text(pref) for pref in list(status.get("preferences") or [])]
+        user_payload = {
+            "driver_id": driver_id,
+            "simulation_progress_minutes": int(status.get("simulation_progress_minutes", 0) or 0),
+            "current_position": {
+                "lat": status.get("current_lat"),
+                "lng": status.get("current_lng"),
+            },
+            "preferences": [text for text in preferences if text],
+            "candidate_cargos": candidate_payload,
+            "instruction": "Only choose one cargo_id from candidate_cargos. Return JSON only.",
+        }
+        return {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a truck dispatch decision assistant. Hard constraints have already been "
+                        "filtered by code. Choose the candidate with the best balance of income, time, "
+                        "low empty driving, and preference safety. Reply only with compact JSON like "
+                        "{\"action\":\"take_order\",\"cargo_id\":\"123456\",\"reason\":\"...\"}."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(user_payload, ensure_ascii=False, separators=(",", ":")),
+                },
+            ],
+            "temperature": 0.1,
+            "max_tokens": 96,
+            "enable_thinking": False,
+        }
+
+    def _extract_model_decision(self, response: dict[str, Any]) -> dict[str, Any]:
+        content = ""
+        choices = response.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if isinstance(first, dict):
+                message = first.get("message")
+                if isinstance(message, dict):
+                    content = str(message.get("content") or "")
+                if not content:
+                    content = str(first.get("text") or "")
+        if not content:
+            content = str(response.get("content") or "")
+        content = content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*", "", content)
+            content = re.sub(r"\s*```$", "", content).strip()
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", content, flags=re.S)
+            if not match:
+                return {}
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     def _safe_query_history(self, driver_id: str) -> None:
         try:
@@ -335,6 +481,12 @@ class ModelDecisionService:
         except (KeyError, TypeError, ValueError):
             return None
         if duration_minutes <= 0 or price <= 0:
+            return None
+        create_minutes = _wall_time_to_minutes(str(cargo.get("create_time", "")))
+        remove_minutes = _wall_time_to_minutes(str(cargo.get("remove_time", "")))
+        if create_minutes is not None and create_minutes > now_minutes:
+            return None
+        if remove_minutes is not None and remove_minutes < now_minutes:
             return None
 
         current_lat = float(status["current_lat"])
@@ -385,6 +537,11 @@ class ModelDecisionService:
             score=score,
             net_income=net_income,
             finish_minutes=finish_minutes,
+            total_minutes=total_minutes,
+            pickup_km=pickup_km,
+            haul_km=haul_km,
+            wait_minutes=wait_minutes,
+            price=price,
         )
 
     def _pickup_distance_km(
