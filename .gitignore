@@ -32,3 +32,6 @@ demo_docs_release_20260509/demo/server/config/config.json
 logs/
 tmp/
 temp/
+
+# Local git worktrees
+.worktrees/
