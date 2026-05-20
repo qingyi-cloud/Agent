@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Jupyter runtime checkpoints
+.ipynb_checkpoints/
+
+# Local secrets and environment files
+.env
+.env.*
+*.pem
+*.key
+*.secret
+
+# Demo data and generated evaluation output
+demo_docs_release_20260509/demo/server/data/
+demo_docs_release_20260509/demo/results/
+demo_docs_release_20260509/demo/server/config/config.json
+
+# Logs and runtime artifacts
+*.log
+logs/
+tmp/
+temp/
